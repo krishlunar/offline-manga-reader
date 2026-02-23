@@ -1,194 +1,157 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { MangaItem, OCRCache, SpeechBubble } from '../types';
-import { analyzeMangaPages, blobUrlToBase64 } from '../utils/ocr';
+import { MangaItem } from '../types';
+import { recognizeTextFromImage, preloadModel } from '../utils/ocr';
 
 interface ReaderProps {
   manga: MangaItem;
   onClose: () => void;
 }
 
-const BATCH_SIZE = 4;
-
 export const Reader: React.FC<ReaderProps> = ({ manga, onClose }) => {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [showControls, setShowControls] = useState(true);
   const [isFullScreen, setIsFullScreen] = useState(false);
   
-  // Analysis State
-  const [analysisCache, setAnalysisCache] = useState<OCRCache>({});
-  const [isAnalysisEnabled, setIsAnalysisEnabled] = useState(false);
-  const processingQueue = useRef<Set<number>>(new Set());
-  
-  // TTS State
-  const [ttsEnabled, setTtsEnabled] = useState(false);
-  const synth = useRef<SpeechSynthesis>(window.speechSynthesis);
-  const [activeBubbleIndex, setActiveBubbleIndex] = useState<number | null>(null);
-  const lastSpokenPageIndexRef = useRef<number | null>(null);
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [startPos, setStartPos] = useState({x:0,y:0});
+  const [selectionRect, setSelectionRect] = useState<{x:number,y:number,w:number,h:number}|null>(null);
+  const [dragged, setDragged] = useState(false);
+  const [isOcrMode, setIsOcrMode] = useState(false);
+  const [isOcrProcessing, setIsOcrProcessing] = useState(false);
+  const [downloadStatus, setDownloadStatus] = useState<string | null>(null);
 
-  // --- Analysis Logic (Batch Queue) ---
-
-  const processBatch = useCallback(async (batchIndex: number) => {
-    // 1. Check if batch is already processing
-    if (processingQueue.current.has(batchIndex)) return;
-
-    // 2. Check if all pages in this batch are already complete
-    const startPage = batchIndex * BATCH_SIZE;
-    const endPage = Math.min(startPage + BATCH_SIZE, manga.pages.length);
-    
-    let allLoaded = true;
-    for (let i = startPage; i < endPage; i++) {
-        if (analysisCache[i]?.status !== 'complete') {
-            allLoaded = false;
-            break;
-        }
-    }
-    if (allLoaded) return;
-
-    // 3. Lock batch
-    processingQueue.current.add(batchIndex);
-
-    // 4. Set Loading State for all pages in batch
-    setAnalysisCache(prev => {
-        const nextState = { ...prev };
-        for (let i = startPage; i < endPage; i++) {
-            // Only overwrite if not already done
-            if (nextState[i]?.status !== 'complete') {
-                nextState[i] = { bubbles: [], status: 'loading' };
-            }
-        }
-        return nextState;
-    });
-
-    try {
-      // 5. Prepare images
-      const imagePromises = [];
-      for (let i = startPage; i < endPage; i++) {
-          imagePromises.push(blobUrlToBase64(manga.pages[i]));
+  useEffect(() => {
+    (async () => {
+      try {
+        await preloadModel((data) => {
+          setDownloadStatus('Downloading Model: ' + Math.round(data.progress * 100) + '%');
+        });
+      } catch (error) {
+        console.error('Failed to preload OCR model:', error);
+        setDownloadStatus(null); // Clear status on error
       }
-      const base64Images = await Promise.all(imagePromises);
-
-      // 6. Call API (Batch)
-      const batchResults = await analyzeMangaPages(base64Images);
-      
-      // 7. Update Cache
-      setAnalysisCache(prev => {
-        const nextState = { ...prev };
-        batchResults.forEach((bubbles, relativeIndex) => {
-            const absoluteIndex = startPage + relativeIndex;
-            
-            // Sort bubbles
-            bubbles.sort((a, b) => {
-                const yDiff = a.box_2d[0] - b.box_2d[0];
-                if (Math.abs(yDiff) > 50) return yDiff;
-                return b.box_2d[1] - a.box_2d[1];
-            });
-
-            nextState[absoluteIndex] = { bubbles, status: 'complete' };
-        });
-        return nextState;
-      });
-    } catch (err) {
-      console.error("Batch analysis failed", err);
-      setAnalysisCache(prev => {
-        const nextState = { ...prev };
-        for (let i = startPage; i < endPage; i++) {
-             nextState[i] = { bubbles: [], status: 'error' };
-        }
-        return nextState;
-      });
-    } finally {
-      processingQueue.current.delete(batchIndex);
-    }
-  }, [manga.pages, analysisCache]);
-
-  // Trigger Strategy
-  useEffect(() => {
-    if (!isAnalysisEnabled) return;
-
-    // Calculate which batch the current page belongs to
-    const currentBatch = Math.floor(currentIndex / BATCH_SIZE);
-    
-    // Process current batch
-    processBatch(currentBatch);
-
-    // Pre-fetch next batch
-    const nextBatch = currentBatch + 1;
-    if (nextBatch * BATCH_SIZE < manga.pages.length) {
-      const timer = setTimeout(() => {
-        processBatch(nextBatch);
-      }, 500);
-      return () => clearTimeout(timer);
-    }
-  }, [currentIndex, isAnalysisEnabled, processBatch, manga.pages.length]);
-
-  // --- TTS Logic ---
-
-  // Separate effect to handle Page Turn or Disable
-  useEffect(() => {
-    if (!ttsEnabled || !isAnalysisEnabled) {
-      synth.current.cancel();
-      setActiveBubbleIndex(null);
-      lastSpokenPageIndexRef.current = null;
-    }
-  }, [ttsEnabled, isAnalysisEnabled]);
-
-  // Effect to queue speech when data becomes available
-  useEffect(() => {
-    if (!ttsEnabled || !isAnalysisEnabled) return;
-
-    const currentPageData = analysisCache[currentIndex];
-
-    // Check if we are already speaking this page content
-    if (lastSpokenPageIndexRef.current === currentIndex && synth.current.speaking) {
-        return; 
-    }
-
-    // Cancel previous page speech if we moved
-    if (lastSpokenPageIndexRef.current !== currentIndex) {
-        synth.current.cancel();
-        setActiveBubbleIndex(null);
-    }
-
-    if (currentPageData?.status === 'complete' && currentPageData.bubbles.length > 0) {
-        lastSpokenPageIndexRef.current = currentIndex;
-        
-        // Queue bubbles one by one
-        currentPageData.bubbles.forEach((bubble, i) => {
-            const utterance = new SpeechSynthesisUtterance(bubble.text);
-            const voices = synth.current.getVoices();
-            const voice = voices.find(v => v.name.includes('Google US English')) || 
-                          voices.find(v => v.lang.startsWith('en'));
-            if (voice) utterance.voice = voice;
-            utterance.rate = 1.0;
-
-            utterance.onstart = () => {
-                setActiveBubbleIndex(i);
-            };
-
-            utterance.onend = () => {
-                // If this was the last bubble, clear highlight
-                if (i === currentPageData.bubbles.length - 1) {
-                    setActiveBubbleIndex(null);
-                }
-            };
-            
-            utterance.onerror = () => {
-                if (i === currentPageData.bubbles.length - 1) {
-                    setActiveBubbleIndex(null);
-                }
-            };
-
-            synth.current.speak(utterance);
-        });
-    }
-  }, [currentIndex, ttsEnabled, isAnalysisEnabled, analysisCache]);
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      synth.current.cancel();
-    };
+    })();
   }, []);
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    if (!isOcrMode) return;
+    setDragged(false);
+    const rect = e.currentTarget.getBoundingClientRect();
+    setStartPos({x: e.clientX - rect.left, y: e.clientY - rect.top});
+    setIsDrawing(true);
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (!isOcrMode || !isDrawing) return;
+    setDragged(true);
+    const rect = e.currentTarget.getBoundingClientRect();
+    const endX = e.clientX - rect.left;
+    const endY = e.clientY - rect.top;
+    const x = Math.min(startPos.x, endX);
+    const y = Math.min(startPos.y, endY);
+    const w = Math.abs(endX - startPos.x);
+    const h = Math.abs(endY - startPos.y);
+    setSelectionRect({x, y, w, h});
+  };
+
+  const handleMouseUp = async (e: React.MouseEvent) => {
+    if (!isOcrMode || !isDrawing) return;
+    setIsOcrProcessing(true);
+    setIsDrawing(false);
+    setDragged(true);
+    const rect = e.currentTarget.getBoundingClientRect();
+    const endX = e.clientX - rect.left;
+    const endY = e.clientY - rect.top;
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.src = manga.pages[currentIndex];
+    img.onload = async () => {
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      const imgRect = e.currentTarget.getBoundingClientRect();
+      const scaleX = img.naturalWidth / imgRect.width;
+      const scaleY = img.naturalHeight / imgRect.height;
+      const cropX = Math.min(startPos.x, endX) * scaleX;
+      const cropY = Math.min(startPos.y, endY) * scaleY;
+      const cropW = Math.abs(endX - startPos.x) * scaleX;
+      const cropH = Math.abs(endY - startPos.y) * scaleY;
+      canvas.width = cropW;
+      canvas.height = cropH;
+      ctx.drawImage(img, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+      const dataURL = canvas.toDataURL('image/png');
+      try {
+        const text = await recognizeTextFromImage(dataURL);
+        alert(`Recognized text: ${text}`);
+        setIsOcrMode(false);
+      } finally {
+        setIsOcrProcessing(false);
+      }
+    };
+    setSelectionRect(null);
+  };
+
+  const handleTouchStart = (e: React.TouchEvent) => {
+    if (!isOcrMode) return;
+    e.preventDefault();
+    setDragged(false);
+    const rect = e.currentTarget.getBoundingClientRect();
+    const touch = e.touches[0];
+    setStartPos({x: touch.clientX - rect.left, y: touch.clientY - rect.top});
+    setIsDrawing(true);
+  };
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    if (!isOcrMode || !isDrawing) return;
+    e.preventDefault();
+    setDragged(true);
+    const rect = e.currentTarget.getBoundingClientRect();
+    const touch = e.touches[0];
+    const endX = touch.clientX - rect.left;
+    const endY = touch.clientY - rect.top;
+    const x = Math.min(startPos.x, endX);
+    const y = Math.min(startPos.y, endY);
+    const w = Math.abs(endX - startPos.x);
+    const h = Math.abs(endY - startPos.y);
+    setSelectionRect({x, y, w, h});
+  };
+
+  const handleTouchEnd = async (e: React.TouchEvent) => {
+    if (!isOcrMode || !isDrawing) return;
+    e.preventDefault();
+    setIsOcrProcessing(true);
+    setIsDrawing(false);
+    setDragged(true);
+    const rect = e.currentTarget.getBoundingClientRect();
+    const touch = e.changedTouches[0];
+    const endX = touch.clientX - rect.left;
+    const endY = touch.clientY - rect.top;
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.src = manga.pages[currentIndex];
+    img.onload = async () => {
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      const imgRect = e.currentTarget.getBoundingClientRect();
+      const scaleX = img.naturalWidth / imgRect.width;
+      const scaleY = img.naturalHeight / imgRect.height;
+      const cropX = Math.min(startPos.x, endX) * scaleX;
+      const cropY = Math.min(startPos.y, endY) * scaleY;
+      const cropW = Math.abs(endX - startPos.x) * scaleX;
+      const cropH = Math.abs(endY - startPos.y) * scaleY;
+      canvas.width = cropW;
+      canvas.height = cropH;
+      ctx.drawImage(img, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+      const dataURL = canvas.toDataURL('image/png');
+      try {
+        const text = await recognizeTextFromImage(dataURL);
+        alert(`Recognized text: ${text}`);
+        setIsOcrMode(false);
+      } finally {
+        setIsOcrProcessing(false);
+      }
+    };
+    setSelectionRect(null);
+  };
 
   // --- Navigation & UI ---
 
@@ -225,16 +188,24 @@ export const Reader: React.FC<ReaderProps> = ({ manga, onClose }) => {
   const handlePrev = () => setCurrentIndex((prev) => Math.max(prev - 1, 0));
   const toggleControls = () => setShowControls(!showControls);
 
-  const currentAnalysis = analysisCache[currentIndex];
-  const isLoading = currentAnalysis?.status === 'loading';
-
   return (
     <div className="relative h-screen w-full flex items-center justify-center bg-black overflow-hidden select-none font-sans">
+      {downloadStatus && (
+        <div className="fixed top-0 left-0 right-0 bg-blue-600 text-white text-center py-2 z-50">
+          {downloadStatus}
+        </div>
+      )}
       
       {/* Container for Image + Overlays */}
       <div 
         className="relative h-full w-full max-w-5xl flex items-center justify-center"
-        onClick={toggleControls}
+        onClick={(e) => { if (isOcrMode) return; if (dragged) { setDragged(false); return; } toggleControls(); }}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
       >
         <img 
             src={manga.pages[currentIndex]} 
@@ -242,26 +213,32 @@ export const Reader: React.FC<ReaderProps> = ({ manga, onClose }) => {
             alt={`Page ${currentIndex + 1}`}
         />
 
-        {/* Bounding Box Overlays */}
-        {isAnalysisEnabled && currentAnalysis?.status === 'complete' && (
-            <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
-                <OverlayLayer 
-                    bubbles={currentAnalysis.bubbles} 
-                    activeBubbleIndex={activeBubbleIndex}
-                />
+        {isOcrMode && (
+          <div className="absolute inset-0 bg-black/30 pointer-events-none z-10" />
+        )}
+
+        {selectionRect && isOcrMode && (
+          <div 
+            className="absolute border-2 border-blue-500 bg-blue-500/20 pointer-events-none"
+            style={{
+              left: selectionRect.x,
+              top: selectionRect.y,
+              width: selectionRect.w,
+              height: selectionRect.h,
+            }}
+          />
+        )}
+
+        {isOcrProcessing && (
+          <div className="absolute inset-0 bg-black/80 flex items-center justify-center z-50">
+            <div className="text-white text-4xl font-bold text-center">
+              🤖 AI is Processing / Downloading... Please wait
             </div>
+          </div>
         )}
       </div>
 
-      {/* Loading Indicator */}
-      {isAnalysisEnabled && isLoading && (
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-20 flex flex-col items-center gap-2">
-            <div className="size-12 rounded-full border-4 border-primary border-t-transparent animate-spin drop-shadow-lg"></div>
-            <div className="bg-black/60 backdrop-blur-md px-4 py-1 rounded-full text-white text-xs font-bold uppercase tracking-wider">
-                Analyzing Batch...
-            </div>
-        </div>
-      )}
+
 
       {/* Top Overlay */}
       <div className={`absolute top-0 left-0 right-0 p-6 flex justify-between items-start transition-opacity duration-300 z-30 ${showControls ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
@@ -272,20 +249,7 @@ export const Reader: React.FC<ReaderProps> = ({ manga, onClose }) => {
           <span className="material-symbols-outlined text-2xl">home</span>
         </button>
 
-        {/* TTS Toggle Pill */}
-        {isAnalysisEnabled && (
-             <button 
-                onClick={(e) => { e.stopPropagation(); setTtsEnabled(!ttsEnabled); }}
-                className={`flex items-center gap-2 px-4 h-12 rounded-full backdrop-blur-md border transition-all ${ttsEnabled ? 'bg-primary text-white border-primary/50' : 'bg-reader-dark/40 text-white/70 border-white/10 hover:bg-reader-dark/60'}`}
-             >
-                <span className="material-symbols-outlined text-xl">
-                    {ttsEnabled ? 'volume_up' : 'volume_off'}
-                </span>
-                <span className="text-sm font-medium hidden sm:inline">
-                    {ttsEnabled ? 'Audio On' : 'Audio Off'}
-                </span>
-             </button>
-        )}
+
 
         <button 
           onClick={toggleFullScreen}
@@ -324,16 +288,12 @@ export const Reader: React.FC<ReaderProps> = ({ manga, onClose }) => {
             <span className="material-symbols-outlined text-white text-3xl">chevron_left</span>
           </button>
 
-          {/* Central Action: Analysis Toggle */}
-          <div className="relative group">
-             <button 
-                 onClick={() => setIsAnalysisEnabled(!isAnalysisEnabled)}
-                 className={`size-16 flex items-center justify-center rounded-lg transition-all border ${isAnalysisEnabled ? 'bg-primary text-white border-primary shadow-[0_0_20px_rgba(75,43,238,0.5)]' : 'bg-white/5 text-white/80 border-white/5 hover:bg-white/10'}`}
-                 title="Toggle AI Analysis"
-             >
-                 <span className="material-symbols-outlined text-3xl">psychology</span>
-             </button>
-          </div>
+          <button 
+            onClick={() => setIsOcrMode(true)}
+            className="size-14 flex items-center justify-center rounded-lg hover:bg-white/10 transition-colors"
+          >
+            <span className="material-symbols-outlined text-white text-3xl">text_fields</span>
+          </button>
 
           <button 
             onClick={handleNext}
@@ -348,76 +308,3 @@ export const Reader: React.FC<ReaderProps> = ({ manga, onClose }) => {
   );
 };
 
-// Helper component to handle positioning
-const OverlayLayer: React.FC<{ bubbles: SpeechBubble[], activeBubbleIndex: number | null }> = ({ bubbles, activeBubbleIndex }) => {
-    const [imgRect, setImgRect] = useState<{width: number, height: number} | null>(null);
-    const containerRef = useRef<HTMLDivElement>(null);
-
-    useEffect(() => {
-        const updateRect = () => {
-            if (containerRef.current) {
-                const img = containerRef.current.parentElement?.querySelector('img');
-                if (img) {
-                    setImgRect({
-                        width: img.offsetWidth,
-                        height: img.offsetHeight
-                    });
-                }
-            }
-        };
-        updateRect();
-        window.addEventListener('resize', updateRect);
-        const interval = setInterval(updateRect, 500);
-        return () => {
-            window.removeEventListener('resize', updateRect);
-            clearInterval(interval);
-        }
-    }, []);
-
-    if (!imgRect) return <div ref={containerRef} />;
-
-    return (
-        <div 
-            ref={containerRef}
-            style={{ 
-                width: imgRect.width, 
-                height: imgRect.height, 
-                position: 'absolute' 
-            }}
-        >
-            {bubbles.map((bubble, i) => {
-                const [ymin, xmin, ymax, xmax] = bubble.box_2d;
-                const top = (ymin / 1000) * 100;
-                const left = (xmin / 1000) * 100;
-                const height = ((ymax - ymin) / 1000) * 100;
-                const width = ((xmax - xmin) / 1000) * 100;
-
-                const isActive = i === activeBubbleIndex;
-
-                return (
-                    <div
-                        key={i}
-                        className={`absolute transition-all duration-300 group ${isActive ? 'border-4 border-green-400 bg-green-400/20 z-50 shadow-[0_0_15px_rgba(74,222,128,0.5)]' : 'border-2 border-red-500 bg-red-500/10 hover:bg-red-500/20'}`}
-                        style={{
-                            top: `${top}%`,
-                            left: `${left}%`,
-                            width: `${width}%`,
-                            height: `${height}%`,
-                        }}
-                        title={bubble.text}
-                    >
-                        {/* Number Badge (Hide if active to reduce clutter, or change color) */}
-                        <div className={`absolute -top-3 -left-3 size-6 rounded-full text-white text-xs font-bold flex items-center justify-center shadow-md z-10 ${isActive ? 'bg-green-600 scale-110' : 'bg-red-600'}`}>
-                            {i + 1}
-                        </div>
-                        
-                        {/* Tooltip */}
-                        <div className={`opacity-0 group-hover:opacity-100 absolute bottom-full left-1/2 -translate-x-1/2 mb-2 bg-black/90 text-white text-xs p-2 rounded w-48 pointer-events-none transition-opacity z-20 ${isActive ? 'hidden' : ''}`}>
-                            {bubble.text}
-                        </div>
-                    </div>
-                );
-            })}
-        </div>
-    );
-};
